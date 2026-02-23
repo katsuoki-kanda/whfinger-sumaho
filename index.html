@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Hand Skeleton Game - Mobile v3.3</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { margin: 0; background: #000; color: white; font-family: 'Arial Black', sans-serif; overflow: hidden; touch-action: none; }
+        
+        canvas { 
+            position: absolute; 
+            left: 0; 
+            top: 0; 
+            width: 100vw; 
+            height: 100vh; 
+            object-fit: cover; 
+            transform: scaleX(-1); 
+            background: #000;
+        }
+
+        #ui-layer { 
+            position: absolute; 
+            width: 100%; height: 100%; 
+            pointer-events: none; 
+            display: flex;
+            flex-direction: column;
+            box-sizing: border-box;
+            padding: env(safe-area-inset-top) 20px env(safe-area-inset-bottom) 20px;
+            z-index: 10;
+        }
+        
+        .hud { 
+            display: flex;
+            justify-content: space-between;
+            padding: 20px 0;
+            font-size: 24px; 
+            color: #0f0; 
+            text-shadow: 2px 2px 4px #000; 
+        }
+
+        #msg { 
+            text-align: center; 
+            font-size: 10vw; 
+            color: #ffff00; 
+            text-shadow: 3px 3px 5px #000; 
+            height: 1.2em;
+        }
+        
+        .question-area { 
+            display: flex; 
+            justify-content: space-around; 
+            align-items: center;
+            flex: 1; 
+            width: 100%; 
+        }
+        
+        .target-num { 
+            font-size: 45vw; 
+            font-weight: bold; 
+            color: #ff00ff; 
+            line-height: 1; 
+            text-shadow: 0 0 20px rgba(255,0,255,0.5); 
+        }
+        
+        .correct-highlight { 
+            color: #00ffff !important; 
+            text-shadow: 0 0 30px rgba(0,255,255,1);
+            transform: scale(1.1);
+        }
+        
+        /* 画面下部のガイドエリア：画面の下30%程度を占める想定 */
+        .bottom-counter {
+            display: flex;
+            justify-content: space-around;
+            background: rgba(0, 0, 0, 0.7);
+            border: 3px solid #0f0;
+            border-radius: 15px;
+            padding: 20px 0;
+            margin-bottom: 10px;
+            pointer-events: auto;
+            backdrop-filter: blur(8px);
+        }
+
+        .count-item {
+            text-align: center;
+            font-size: 16px;
+            color: #0f0;
+        }
+        .count-val {
+            font-size: 45px;
+            display: block;
+            color: #fff;
+            font-weight: bold;
+        }
+
+        .footer-hint {
+            font-size: 12px;
+            color: #aaa;
+            text-align: center;
+            padding-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+
+    <video id="input_video" style="display:none;" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div id="ui-layer">
+        <div class="hud">
+            <div>SCORE: <span id="score">0</span></div>
+            <div>TIME: <span id="timer">60</span></div>
+        </div>
+        
+        <div id="msg">手を挙げて開始</div>
+
+        <div class="question-area">
+            <div id="target-l" class="target-num">-</div>
+            <div id="target-r" class="target-num">-</div>
+        </div>
+
+        <div class="bottom-counter" id="gui-bottom">
+            <div class="count-item">左手<span id="cur-l" class="count-val">0</span></div>
+            <div class="count-item">右手<span id="cur-r" class="count-val">0</span></div>
+        </div>
+        
+        <div class="footer-hint">手首をガイド枠より上へ挙げてください</div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        
+        const scoreEl = document.getElementById('score'), timerEl = document.getElementById('timer');
+        const targetLEl = document.getElementById('target-l'), targetREl = document.getElementById('target-r');
+        const curLEl = document.getElementById('cur-l'), curREl = document.getElementById('cur-r');
+        const msgEl = document.getElementById('msg');
+
+        let score = 0, timeLeft = 60, gameActive = false;
+        let targetL = 0, targetR = 0;
+        let lastSuccessTime = 0;
+        let audioCtx = null;
+
+        // 【しきい値設定】
+        const START_THRESHOLD = 0.3;   // 画面上部30%より上でスタート
+        const INVALID_THRESHOLD = 0.7; // 画面下部70%（ガイド枠付近）より下は検出無効
+
+        function initAudioContext() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+        }
+
+        window.addEventListener('touchstart', initAudioContext, {passive: true});
+
+        function speak(text) {
+            if (!window.speechSynthesis) return;
+            window.speechSynthesis.cancel();
+            const uttr = new SpeechSynthesisUtterance(text);
+            uttr.lang = 'ja-JP';
+            window.speechSynthesis.speak(uttr);
+        }
+
+        function nextRound() {
+            targetLEl.classList.remove('correct-highlight');
+            targetREl.classList.remove('correct-highlight');
+            let nextL, nextR;
+            do {
+                nextL = Math.floor(Math.random() * 5) + 1;
+                nextR = Math.floor(Math.random() * 5) + 1;
+            } while (nextL === targetL && nextR === targetR);
+            targetL = nextL; targetR = nextR;
+            targetLEl.innerText = targetL; targetREl.innerText = targetR;
+        }
+
+        function startGame() {
+            if (gameActive) return;
+            initAudioContext();
+            score = 0; timeLeft = 60;
+            scoreEl.innerText = score;
+            gameActive = true;
+            msgEl.innerText = ""; 
+            speak("スタート");
+            nextRound();
+            const timer = setInterval(() => {
+                if (!gameActive) { clearInterval(timer); return; }
+                timeLeft--;
+                timerEl.innerText = timeLeft;
+                if (timeLeft <= 0) {
+                    gameActive = false;
+                    msgEl.innerText = "終了！";
+                    speak(score + "点です。");
+                }
+            }, 1000);
+        }
+
+        function onResults(results) {
+            if (canvasElement.width !== window.innerWidth || canvasElement.height !== window.innerHeight) {
+                canvasElement.width = window.innerWidth;
+                canvasElement.height = window.innerHeight;
+            }
+
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            let detectedL = 0, detectedR = 0;
+            let startTrigger = false;
+
+            if (results.multiHandLandmarks && results.multiHandedness) {
+                for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                    const landmarks = results.multiHandLandmarks[i];
+                    const wrist = landmarks[0]; 
+
+                    // --- 検出無効化ロジック ---
+                    // 手首がガイド枠の上端（INVALID_THRESHOLD）より下にある場合は完全に無視
+                    if (wrist.y > INVALID_THRESHOLD) {
+                        continue; 
+                    }
+
+                    const isLeftHandSlot = wrist.x > 0.5;
+                    const label = results.multiHandedness[i].label; 
+                    const count = analyzeFingers(landmarks, label);
+                    
+                    if (isLeftHandSlot) detectedL = count;
+                    else detectedR = count;
+
+                    // スタート判定：手首が上部30%に入った場合
+                    if (!gameActive && wrist.y < START_THRESHOLD) startTrigger = true;
+
+                    // スケルトン描画（無効エリア外の時のみ実行される）
+                    drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 5});
+                    drawLandmarks(canvasCtx, landmarks, {color: '#FF0000', radius: 4});
+                }
+            }
+
+            curLEl.innerText = detectedL;
+            curREl.innerText = detectedR;
+
+            if (!gameActive && startTrigger) startGame();
+
+            if (gameActive) {
+                // 正解判定
+                if (detectedL === targetL) targetLEl.classList.add('correct-highlight');
+                else targetLEl.classList.remove('correct-highlight');
+
+                if (detectedR === targetR) targetREl.classList.add('correct-highlight');
+                else targetREl.classList.remove('correct-highlight');
+
+                if (detectedL === targetL && detectedR === targetR && (Date.now() - lastSuccessTime > 1000)) {
+                    score++;
+                    scoreEl.innerText = score;
+                    msgEl.innerText = "OK!";
+                    lastSuccessTime = Date.now();
+                    playBeep();
+                    setTimeout(() => { if(gameActive) { msgEl.innerText = ""; nextRound(); } }, 500);
+                }
+            }
+            canvasCtx.restore();
+        }
+
+        function analyzeFingers(lm, label) {
+            let count = 0;
+            let isThumbUp = (label === 'Right') ? (lm[4].x < lm[3].x) : (lm[4].x > lm[3].x);
+            if (isThumbUp) count++;
+            [8, 12, 16, 20].forEach(tip => { if (lm[tip].y < lm[tip - 2].y) count++; });
+            return count;
+        }
+
+        function playBeep() {
+            initAudioContext();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.frequency.value = 880;
+            const now = audioCtx.currentTime;
+            osc.start(now);
+            gain.gain.setValueAtTime(0.5, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
+            osc.stop(now + 0.12);
+        }
+
+        const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+        hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+        hands.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user'
+        });
+        camera.start();
+
+        window.addEventListener('resize', () => {
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+        });
+    </script>
+</body>
+</html>
